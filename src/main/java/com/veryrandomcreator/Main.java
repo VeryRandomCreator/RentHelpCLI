@@ -1,13 +1,13 @@
 package com.veryrandomcreator;
 
+import com.google.gson.Gson;
+import com.google.gson.JsonObject;
 import org.bouncycastle.asn1.*;
 
-import java.io.BufferedReader;
-import java.io.ByteArrayInputStream;
-import java.io.IOException;
-import java.io.InputStreamReader;
+import java.io.*;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.security.*;
@@ -19,13 +19,18 @@ import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 
-// TODO:
-//   - Modify for long-term support (for when the certificate expires)
-//      - Handle certificate expiration
-//      - Change google's hardcoded root certificate to one that handles rotating certificates
-//      - https://developer.android.com/privacy-and-security/security-key-attestation
 public class Main {
-    public static final String GITHUB_BUILD_HASH = "3C:1C:DC:3B:CF:FA:5D:85:0B:4E:41:A6:A9:68:F7:09:39:FD:08:8B:1A:E1:A0:5D:FC:B3:48:CC:16:7F:04:3C"
+    public static final String[] ATTESTATION_SECURITY_LEVELS = {"SOFTWARE", "TEE", "STRONGBOX"};
+
+    public static final String[] ROOT_FILES = {
+            "/roots/google_root_1.pem",
+            "/roots/google_root_2.pem",
+            "/roots/google_root_legacy_1.pem",
+            "/roots/google_root_legacy_2.pem",
+            "/roots/google_root_legacy_3.pem"
+    };
+
+    public static final String GITHUB_BUILD_HASH = "05:92:64:62:B7:A5:70:48:63:01:77:54:96:F8:0D:D1:12:94:37:25:E5:11:7D:9C:66:26:22:75:F9:7D:05:3C"
             .replaceAll(":", "");
 
     // make it so you can just put the files in args. cli
@@ -34,9 +39,8 @@ public class Main {
         String pdfPath = null;
         String signaturePath = null;
         String pemPath = null;
-        boolean showHash = false;
 
-        for (int i = 0; i < args.length; i++) {
+        for (int i = 0; i < args.length; i++) { // TODO: HANDLE IF ANY OF THE FILE NAMES HAVE SPACES
             switch (args[i]) {
                 case "-pdf":
                     if (i + 1 < args.length)
@@ -50,16 +54,12 @@ public class Main {
                     if (i + 1 < args.length)
                         pemPath = args[++i];
                     break;
-                case "-showhash":
-                    showHash = true;
-                    break;
             }
         }
 
         if (pdfPath == null || signaturePath == null || pemPath == null) {
             System.out.println("Error: Missing required arguments.");
-            System.out.println(
-                    "Usage: java -jar RentHelpCLI.jar -pdf <.pdf file> -signature <.sig file> -pem <.pem.crt file> [-showhash]");
+            System.out.println("Usage: java -jar RentHelpCLI.jar -pdf <.pdf file> -signature <.sig file> -pem <.pem.crt file> [-showhash]");
             return;
         }
 
@@ -71,10 +71,43 @@ public class Main {
         byte[] signatureBytes = Files.readAllBytes(Paths.get(signaturePath));
         byte[] pemBytes = Files.readAllBytes(Paths.get(pemPath));
 
-        // 2: Parse the Certificate Chain
         System.out.println("2. Parsing the X.509 PEM Certificate Chain...");
         CertificateFactory certFactory = CertificateFactory.getInstance("X.509");
+
         Collection<? extends Certificate> certs = certFactory.generateCertificates(new ByteArrayInputStream(pemBytes));
+
+        // fix numbers: Verify Certificate
+
+        Set<TrustAnchor> trustAnchors = new HashSet<>();
+
+        for (String root : ROOT_FILES) {
+            try (InputStream is = Main.class.getResourceAsStream(root)) {
+                if (is == null) {
+                    throw new RuntimeException("Missing root certificate: " + root);
+                }
+
+                X509Certificate rootCert = (X509Certificate) certFactory.generateCertificate(is);
+                trustAnchors.add(new TrustAnchor(rootCert, null));
+            }
+        }
+
+        List<? extends Certificate> certList = new ArrayList<>(certs);
+        CertPath certPath = certFactory.generateCertPath(certList);
+
+        PKIXParameters pkixParameters = new PKIXParameters(trustAnchors);
+        pkixParameters.setRevocationEnabled(false);
+
+        CertPathValidator validator = CertPathValidator.getInstance("PKIX");
+
+        try {
+            validator.validate(certPath, pkixParameters);
+            System.out.println("Chain of Trust SUCCESS: Chain anchors to Google Root CA");
+        } catch (Exception e) {
+            System.out.println("Chain of Trust FAILED: " + e.getMessage());
+            return;
+        }
+
+        // 2: Parse the Certificate Chain
 
         Iterator<? extends Certificate> iterator = certs.iterator();
 
@@ -100,7 +133,7 @@ public class Main {
 
         // 4: Parse Attestation Extension
 
-        System.out.println("4. Analyzing Device and App Integrity...");
+        System.out.println("4. Analyzing Device, App, and Key Integrity...");
 
         // Google's official Object Identifier (OID) for Android Key Attestation
         String attestationOID = "1.3.6.1.4.1.11129.2.1.17";
@@ -114,7 +147,26 @@ public class Main {
         ASN1OctetString extOctet = (ASN1OctetString) ASN1Primitive.fromByteArray(extensionValue);
         ASN1Sequence keyDescription = (ASN1Sequence) ASN1Primitive.fromByteArray(extOctet.getOctets());
 
-        // 2. Catch the Rooted Phone (Hardware Level)
+        int attestationSecurityLevel = ((ASN1Enumerated) keyDescription.getObjectAt(1)).getValue().intValue();
+
+        int keymasterSecurityLevel = ((ASN1Enumerated) keyDescription.getObjectAt(3)).getValue().intValue();
+
+        String secLevel = attestationSecurityLevel >= 0 && attestationSecurityLevel <= 2 ?
+                ATTESTATION_SECURITY_LEVELS[attestationSecurityLevel] : "UNKNOWN";
+
+        System.out.println("Attestation Security Level: " + secLevel + " (" + attestationSecurityLevel + ")");
+
+        if (attestationSecurityLevel == 0) {
+            System.out.println("Security Level FAILED: Software generated key. Unsecure.");
+            return;
+        }
+
+        if (keymasterSecurityLevel == 0) {
+            System.out.println("Security Level FAILED: Attestation was performed in software. Untrustworthy.");
+            return;
+        }
+
+        System.out.println("Security Level SUCCESS: Key is hardware-backed");
 
         ASN1Sequence teeEnforced = (ASN1Sequence) keyDescription.getObjectAt(7);
         boolean foundRot = false;
@@ -131,21 +183,24 @@ public class Main {
 
                 String stateStr = (bootState == 0) ? "VERIFIED"
                         : (bootState == 1) ? "SELF_SIGNED"
-                                : (bootState == 2) ? "UNVERIFIED (Rooted/Unlocked)" : "FAILED";
+                        : (bootState == 2) ? "UNVERIFIED (Rooted/Unlocked)" : "FAILED";
 
                 System.out.println("Bootloader Locked: " + isLocked);
                 System.out.println("Verified Boot State: " + stateStr);
 
                 if (!isLocked || bootState != 0) {
                     System.out.println("Device Integrity FAILED: DEVICE IS ROOTED OR COMPROMISED!");
+                    return;
                 } else {
                     System.out.println("Device Integrity SUCCESS: Device is physically secure.");
                 }
                 break;
             }
         }
-        if (!foundRot)
+        if (!foundRot) {
             System.out.println("Device Integrity FAILED: No Root of Trust found.");
+            return;
+        }
 
         // 3. Extract the App's GitHub Signature (Software Level)
         // Application ID is located inside softwareEnforced (Index 6 of KeyDescription)
@@ -173,50 +228,85 @@ public class Main {
                 System.out.println("Extracted App Signature (SHA-256): " + hexString.toString());
                 if (hexString.toString().equals(GITHUB_BUILD_HASH)) {
                     System.out.println("App Integrity SUCCESS: App hash matches github apk hash!");
+                } else {
+                    System.out.println("App Integrity FAILED: App hash does not match github apk hash!");
+                    return;
                 }
                 break;
             }
         }
-        if (!foundAppId)
+        if (!foundAppId) {
             System.out.println("App Integrity Failed: Could not find App ID.");
+            return;
+        }
 
-        if (showHash) {
-            // 4. Extract the Challenge (The Block Hash)
-            ASN1OctetString challengeOctet = (ASN1OctetString) keyDescription
-                    .getObjectAt(4);
+        // 4. Extract the Challenge (The Block Hash)
+        ASN1OctetString challengeOctet = (ASN1OctetString) keyDescription
+                .getObjectAt(4);
 
-            byte[] challengeBytes = challengeOctet.getOctets();
+        byte[] challengeBytes = challengeOctet.getOctets();
 
-            String extractedBlockHash = new String(challengeBytes);
+        String extractedBlockHash = new String(challengeBytes, StandardCharsets.UTF_8);
 
-            System.out.println("Extracted Challenge (Block Hash): " + extractedBlockHash);
+        System.out.println("Extracted Challenge (Block Hash): " + extractedBlockHash);
 
-            // 5. Fetch timestamp of hash
+        if (!extractedBlockHash.matches("[0-9a-fA-F]{64}")) {
+            System.out.println("Hash FAILED: Challenge is not a valid block hash format.");
+            return;
+        }
 
+        // 5. Fetch timestamp of hash
+
+        String data;
+        try {
             URL url = new URL("https://mempool.space/api/block/" + extractedBlockHash);
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("GET");
+            conn.setConnectTimeout(10000);
+            conn.setReadTimeout(10000);
+
+            int responseCode = conn.getResponseCode();
+            if (responseCode == 404) {
+                System.out.println("Hash FAILED: Block hash not found on blockchain. Page does not exist.");
+                return;
+            } else if (responseCode != 200) {
+                System.out.println("Hash FAILED: Unexpected response from blockchain node: HTTP " + responseCode);
+                return;
+            }
 
             BufferedReader in = new BufferedReader(new InputStreamReader(conn.getInputStream()));
-            String data = in.readLine();
+            data = in.readLine();
             in.close();
-
-            long timestamp = 0;
-            for (String item : data.split(",")) {
-                if (item.contains("timestamp")) {
-                    timestamp = Long.parseLong(item.split(":")[1]);
-
-                    ZonedDateTime blockTime = Instant.ofEpochSecond(timestamp).atZone(ZoneId.systemDefault());
-                    DateTimeFormatter formatter = DateTimeFormatter.ofPattern("MMM dd, yyyy HH:mm:ss z");
-
-                    System.out.println("Hash Timestamp: " + blockTime.format(formatter));
-                }
-            }
-            if (timestamp == 0) {
-                System.out.println("HASH TIMESTAMP FAILED!");
-            }
+        } catch (IOException e) {
+            System.out.println("Connection failure. Hash not validated.");
+            return;
         }
 
-        // Todo: Running out of time to implement, but the certificate still needs to be verified to have full coverage.
+        Gson gson = new Gson();
+        JsonObject body = gson.fromJson(data, JsonObject.class);
+        long timestamp;
+        try {
+            if (body == null || !body.has("timestamp")) {
+                System.out.println("Hash FAILED: No timestamp in response. Hash may not be a real confirmed block.");
+                return;
+            }
+
+            timestamp = body.get("timestamp").getAsLong();
+
+            if (timestamp < 0) {
+                System.out.println("Hash FAILED: Invalid timestamp: " + timestamp);
+                return;
+            }
+
+            ZonedDateTime blockTime = Instant.ofEpochSecond(timestamp).atZone(ZoneId.systemDefault());
+            DateTimeFormatter formatter = DateTimeFormatter.ofPattern("MMM dd, yyyy HH:mm:ss z");
+
+            System.out.println("Hash Timestamp: " + blockTime.format(formatter));
+
+
+        } catch (Exception e) {
+            System.out.println("Hash FAILED! " + data);
+            return;
+        }
     }
 }
